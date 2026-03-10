@@ -19,25 +19,26 @@ import textwrap
 import numpy as np
 import pytest
 
-from chemsmart.io.gaussian.external_script import ASEExternalCalculatorScript
+from chemsmart.io.gaussian.external_script import (
+    ASEExternalCalculatorScript,
+    ASEPickleExternalScript,
+    GaussianExternalInput,
+)
 from chemsmart.io.molecules.structure import Molecule
 from chemsmart.jobs.gaussian.external import GaussianExternalJob
 from chemsmart.jobs.gaussian.settings import GaussianExternalJobSettings
 from chemsmart.settings.gaussian import GaussianProjectSettings
 
-# ── Stub calculator without todict() (used for the pickle-fallback test) ─
+
 class _NoDictCalc:
     """Minimal pickle-able calculator stub that has no todict() method."""
     pass
 
 
-# ── Unit conversions (shared with the generated script) ───────────────────
 _BOHR_TO_ANG = 0.529177210903
 _EV_PER_HA = 27.211386245988
 _GRAD_CONV = _BOHR_TO_ANG / _EV_PER_HA  # (eV/Å) → (Ha/Bohr)
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────
 
 def _write_gaussian_external_input(path, positions_ang, atomic_numbers, deriv=1):
     """Write a minimal Gaussian External input file (positions in Bohr)."""
@@ -53,12 +54,8 @@ def _write_gaussian_external_input(path, positions_ang, atomic_numbers, deriv=1)
             )
 
 
-# ── Tests ─────────────────────────────────────────────────────────────────
-
 class TestGaussianExternalIntegration:
     """End-to-end tests for the Gaussian External calculator interface."""
-
-    # ── 1. Settings and route string ──────────────────────────────────────
 
     def test_route_string_opt(self):
         """opt job produces '# opt External=<script>' route."""
@@ -95,7 +92,6 @@ class TestGaussianExternalIntegration:
             charge=0,
             multiplicity=1,
         )
-        # Gaussian convention: External="<script> <extra_args>"
         assert 'External="RunTink Amber"' in s.route_string
 
     def test_project_settings_external(self):
@@ -106,36 +102,84 @@ class TestGaussianExternalIntegration:
         assert es.freq is False
         assert es.forces is False
 
-    # ── 2. Script generation ──────────────────────────────────────────────
+    def test_gaussian_external_input_parsing(self, tmp_path):
+        """GaussianExternalInput correctly parses a Gaussian External input file."""
+        atomic_numbers = [79, 79]
+        positions_ang = [[0.0, 0.0, 0.0], [0.0, 0.0, 2.88]]
+        input_file = str(tmp_path / "test.dat")
+        _write_gaussian_external_input(input_file, positions_ang, atomic_numbers, deriv=1)
+
+        inp = GaussianExternalInput(input_file)
+        assert inp.natoms == 2
+        assert inp.deriv_order == 1
+        assert inp.charge == 0
+        assert inp.spin == 1
+        assert inp.atomic_numbers == [79, 79]
+        assert len(inp.positions_ang) == 2
+        assert np.allclose(inp.positions_ang[1][2], 2.88, atol=1e-6)
 
     def test_script_written_and_executable(self, tmp_path):
         """Code-generation path: script file is written and executable."""
         from ase.calculators.emt import EMT
 
-        script = ASEExternalCalculatorScript(
-            EMT, calc_kwargs={}, script_name="run_emt"
-        )
-        script_path = script.write(str(tmp_path))
+        script = ASEExternalCalculatorScript(EMT, calc_kwargs={})
+        script_path = script.write(str(tmp_path), "run_emt.py")
 
         assert os.path.isfile(script_path)
         assert os.access(script_path, os.X_OK)
         content = open(script_path).read()
         assert "#!/usr/bin/env python" in content
         assert "from ase.calculators.emt import EMT" in content
-        assert "_read_input" in content
+        assert "GaussianExternalInput" in content
         assert "_write_output" in content
         assert "GRAD_CONV" in content
 
+    def test_script_class_raises_on_instance(self):
+        """ASEExternalCalculatorScript raises TypeError when given an instance."""
+        from ase.calculators.emt import EMT
+        with pytest.raises(TypeError, match="calculator_class must be a class"):
+            ASEExternalCalculatorScript(EMT(), calc_kwargs={})
+
+    def test_script_class_raises_without_kwargs(self):
+        """ASEExternalCalculatorScript raises ValueError when calc_kwargs is None."""
+        from ase.calculators.emt import EMT
+        with pytest.raises(ValueError, match="calc_kwargs is required"):
+            ASEExternalCalculatorScript(EMT, calc_kwargs=None)
+
     def test_pickle_fallback_writes_pkl(self, tmp_path):
-        """Pickle path: .pkl file is written when calculator has no todict()."""
+        """Pickle path: .pkl file is written when using ASEPickleExternalScript."""
         calc = _NoDictCalc()
-        script = ASEExternalCalculatorScript(calc, script_name="run_pkl")
-        script.write(str(tmp_path))
+        script = ASEPickleExternalScript(calc)
+        script.write(str(tmp_path), "run_pkl.py")
 
         assert os.path.isfile(tmp_path / "run_pkl.py")
         assert os.path.isfile(tmp_path / "run_pkl.pkl")
 
-    # ── 3. GaussianExternalJob.write_external_script() ───────────────────
+    def test_pickle_script_raises_on_class(self):
+        """ASEPickleExternalScript raises TypeError when given a class."""
+        from ase.calculators.emt import EMT
+        with pytest.raises(TypeError, match="calculator must be an instance"):
+            ASEPickleExternalScript(EMT)
+
+    def test_job_requires_external_script(
+        self, single_molecule_xyz_file, gaussian_jobrunner_no_scratch
+    ):
+        """GaussianExternalJob raises ValueError when external_script is None."""
+        settings = GaussianExternalJobSettings(
+            external_script="run_emt.py",
+            jobtype="opt",
+            charge=0,
+            multiplicity=1,
+        )
+        mol = Molecule.from_filepath(single_molecule_xyz_file)
+        with pytest.raises(ValueError, match="external_script must be provided"):
+            GaussianExternalJob(
+                molecule=mol,
+                settings=settings,
+                label="test_mol",
+                jobrunner=gaussian_jobrunner_no_scratch,
+                external_script=None,
+            )
 
     def test_job_write_external_script(
         self, tmp_path, single_molecule_xyz_file, gaussian_jobrunner_no_scratch
@@ -151,9 +195,7 @@ class TestGaussianExternalIntegration:
             title="EMT opt integration test",
         )
         mol = Molecule.from_filepath(single_molecule_xyz_file)
-        script_writer = ASEExternalCalculatorScript(
-            EMT, calc_kwargs={}, script_name="run_emt"
-        )
+        script_writer = ASEExternalCalculatorScript(EMT, calc_kwargs={})
         job = GaussianExternalJob(
             molecule=mol,
             settings=settings,
@@ -167,7 +209,33 @@ class TestGaussianExternalIntegration:
         assert os.path.isfile(written)
         assert os.access(written, os.X_OK)
 
-    # ── 4. Full round-trip: script execution ─────────────────────────────
+    def test_job_from_calculator(
+        self, tmp_path, single_molecule_xyz_file, gaussian_jobrunner_no_scratch
+    ):
+        """GaussianExternalJob.from_calculator creates a job with a script writer."""
+        from ase.calculators.emt import EMT
+
+        settings = GaussianExternalJobSettings(
+            external_script="run_emt.py",
+            jobtype="opt",
+            charge=0,
+            multiplicity=1,
+            title="from_calculator test",
+        )
+        mol = Molecule.from_filepath(single_molecule_xyz_file)
+        job = GaussianExternalJob.from_calculator(
+            molecule=mol,
+            settings=settings,
+            label="test_mol",
+            calculator_class=EMT,
+            calc_kwargs={},
+            jobrunner=gaussian_jobrunner_no_scratch,
+        )
+        written = job.write_external_script(directory=str(tmp_path))
+
+        assert written is not None
+        assert os.path.isfile(written)
+        assert os.access(written, os.X_OK)
 
     def test_script_execution_energy_and_gradient(self, tmp_path):
         """
@@ -180,27 +248,21 @@ class TestGaussianExternalIntegration:
         """
         from ase.calculators.emt import EMT
 
-        # Write the script
-        script = ASEExternalCalculatorScript(
-            EMT, calc_kwargs={}, script_name="run_emt"
-        )
-        script_path = script.write(str(tmp_path))
+        script = ASEExternalCalculatorScript(EMT, calc_kwargs={})
+        script_path = script.write(str(tmp_path), "run_emt.py")
 
-        # Prepare file paths Gaussian would supply
         input_file = str(tmp_path / "ext.dat")
         output_file = str(tmp_path / "ext.out")
         msg_file = str(tmp_path / "ext.msg")
         fchk_file = str(tmp_path / "ext.fchk")
         matel_file = str(tmp_path / "ext.matel")
 
-        # Au2 molecule: two gold atoms separated by 2.88 Å
         atomic_numbers = [79, 79]
         positions_ang = [[0.0, 0.0, 0.0], [0.0, 0.0, 2.88]]
         _write_gaussian_external_input(
             input_file, positions_ang, atomic_numbers, deriv=1
         )
 
-        # Run the generated script exactly as Gaussian would
         result = subprocess.run(
             [sys.executable, script_path,
              "R", input_file, output_file, msg_file, fchk_file, matel_file],
@@ -213,7 +275,6 @@ class TestGaussianExternalIntegration:
             f"msg: {open(msg_file).read() if os.path.exists(msg_file) else 'no msg file'}"
         )
 
-        # Parse output: line 0 = energy+dipole (4×D20.12), lines 1-2 = gradient
         with open(output_file) as fh:
             lines = fh.readlines()
 
@@ -229,11 +290,8 @@ class TestGaussianExternalIntegration:
             assert len(grad) == 3, f"Gradient line {i} should have 3 components"
             assert all(np.isfinite(float(g)) for g in grad)
 
-        # Sanity-check units: EMT Au2 energy is ~few eV; in Ha that's ~0.1-1 Ha
         assert abs(energy_ha) < 10.0, "Energy unexpectedly large; check units"
 
-
-# ── Real Gaussian run ─────────────────────────────────────────────────────
 
 def _find_g16():
     """Return the g16 executable path, or None if Gaussian is not available."""
@@ -284,19 +342,12 @@ class TestGaussianExternalRealRun:
         """
         from ase.calculators.lj import LennardJones
 
-        # ── 1. Write the ASE External script ─────────────────────────────
-        # sigma=0.5 Å places H2 (r=0.74 Å) in the attractive LJ well.
         script_writer = ASEExternalCalculatorScript(
             LennardJones,
             calc_kwargs={"sigma": 0.5, "epsilon": 0.01},
-            script_name="run_lj",
         )
-        script_path = script_writer.write(str(tmp_path))
+        script_path = script_writer.write(str(tmp_path), "run_lj.py")
 
-        # ── 2. Write the Gaussian .com input ─────────────────────────────
-        # Embed the full interpreter path so Gaussian invokes the right Python,
-        # regardless of what "python" resolves to in the shell that runs g16.
-        # Gaussian calls: <python_exe> <script_path> layer In Out Msg Fchk MatEl
         external_value = f'"{sys.executable} {script_path}"'
 
         com_content = textwrap.dedent(f"""\
@@ -315,7 +366,6 @@ class TestGaussianExternalRealRun:
         com_file = tmp_path / "h2_ext.com"
         com_file.write_text(com_content)
 
-        # ── 3. Run g16 ───────────────────────────────────────────────────
         result = subprocess.run(
             [_G16, str(com_file)],
             capture_output=True,
@@ -327,7 +377,6 @@ class TestGaussianExternalRealRun:
         log_file = tmp_path / "h2_ext.log"
         log_text = log_file.read_text() if log_file.exists() else "(no log)"
 
-        # ── 4. Assert normal termination and reported energy ─────────────
         assert "Normal termination" in log_text, (
             "Gaussian did not terminate normally.\n"
             f"route: {external_value}\n"
@@ -335,7 +384,6 @@ class TestGaussianExternalRealRun:
             f"log tail:\n{log_text[-1500:]}"
         )
 
-        # Gaussian echoes the energy it received from the External script.
         assert "Energy=" in log_text, (
             "No 'Energy=' line found in Gaussian log; "
             "External script may not have written output correctly.\n"
@@ -352,15 +400,12 @@ class TestGaussianExternalRealRun:
         """
         from ase.calculators.lj import LennardJones
 
-        # ── 1. Write the ASE External script ─────────────────────────────
         script_writer = ASEExternalCalculatorScript(
             LennardJones,
             calc_kwargs={"sigma": 0.5, "epsilon": 0.01},
-            script_name="run_lj",
         )
-        script_path = script_writer.write(str(tmp_path))
+        script_path = script_writer.write(str(tmp_path), "run_lj.py")
 
-        # ── 2. Write the Gaussian .com input ─────────────────────────────
         external_value = f'"{sys.executable} {script_path}"'
 
         com_content = textwrap.dedent(f"""\
@@ -379,7 +424,6 @@ class TestGaussianExternalRealRun:
         com_file = tmp_path / "h2_ext_opt.com"
         com_file.write_text(com_content)
 
-        # ── 3. Run g16 ───────────────────────────────────────────────────
         result = subprocess.run(
             [_G16, str(com_file)],
             capture_output=True,
@@ -391,7 +435,6 @@ class TestGaussianExternalRealRun:
         log_file = tmp_path / "h2_ext_opt.log"
         log_text = log_file.read_text() if log_file.exists() else "(no log)"
 
-        # ── 4. Assert normal termination and optimised geometry ──────────
         assert "Normal termination" in log_text, (
             "Gaussian did not terminate normally.\n"
             f"route: {external_value}\n"

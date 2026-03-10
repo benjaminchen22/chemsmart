@@ -1,11 +1,12 @@
 """
 Generator for Gaussian External calculator scripts using ASE.
 
-This module provides ASEExternalCalculatorScript, which writes a
-standalone Python script that Gaussian invokes via the External= keyword.
-The generated script reads Gaussian's external-format input file, runs an
-ASE calculator, and writes the energy (and optionally gradient) back in
-Gaussian's external-format output file.
+This module provides:
+
+- ``GaussianExternalInput``: parses Gaussian's External input file format.
+- ``ASEExternalCalculatorScript``: generates a script from a calculator class.
+- ``ASEPickleExternalScript``: generates a script from a calculator instance
+  via pickle serialisation.
 
 Gaussian External interface
 ---------------------------
@@ -41,15 +42,67 @@ import textwrap
 
 logger = logging.getLogger(__name__)
 
-# ── Unit-conversion constants (atomic units ↔ ASE units) ──────────────────
 _BOHR_TO_ANG = 0.529177210903
 _EV_PER_HA = 27.211386245988
-# Gradient conversion: 1 Ha/Bohr = EV_PER_HA / BOHR_TO_ANG  eV/Å
-# So:  gradient[Ha/Bohr] = gradient[eV/Å] × BOHR_TO_ANG / EV_PER_HA
 _GRAD_CONV = _BOHR_TO_ANG / _EV_PER_HA  # multiply eV/Å gradient by this
 
 
-# ── Script template (code-generation path) ────────────────────────────────
+class GaussianExternalInput:
+    """
+    Parses a Gaussian External input file.
+
+    Gaussian writes the input file in the format::
+
+        natoms  deriv_order  charge  spin          (4I10)
+        atomic_num  x  y  z  mm_charge            (I10, 4F20.12) × natoms
+
+    Positions are in Bohr; this class converts them to Angstrom on read.
+
+    Parameters
+    ----------
+    filename : str
+        Path to the Gaussian External input file to parse.
+
+    Attributes
+    ----------
+    natoms : int
+        Number of atoms.
+    deriv_order : int
+        Derivative order (0 = energy only, 1 = energy + gradient).
+    charge : int
+        Molecular charge.
+    spin : int
+        Spin multiplicity.
+    atomic_numbers : list of int
+        Atomic numbers for each atom.
+    positions_ang : list of [float, float, float]
+        Cartesian positions in Angstrom.
+    """
+
+    BOHR_TO_ANG = _BOHR_TO_ANG
+
+    def __init__(self, filename):
+        with open(filename) as fh:
+            lines = fh.readlines()
+        header = lines[0].split()
+        self.natoms = int(header[0])
+        self.deriv_order = int(header[1])
+        self.charge = int(header[2])
+        self.spin = int(header[3])
+        self.atomic_numbers = []
+        self.positions_ang = []
+        for line in lines[1 : self.natoms + 1]:
+            parts = line.split()
+            self.atomic_numbers.append(int(parts[0]))
+            self.positions_ang.append(
+                [
+                    float(parts[1]) * self.BOHR_TO_ANG,
+                    float(parts[2]) * self.BOHR_TO_ANG,
+                    float(parts[3]) * self.BOHR_TO_ANG,
+                ]
+            )
+
+
 _SCRIPT_TEMPLATE = textwrap.dedent(
     '''\
     #!/usr/bin/env python
@@ -71,44 +124,11 @@ _SCRIPT_TEMPLATE = textwrap.dedent(
     import numpy as np
     from ase import Atoms
     {calc_import}
+    from chemsmart.io.gaussian.external_script import GaussianExternalInput
 
-    # ── Unit-conversion constants ──────────────────────────────────────────
-    BOHR_TO_ANG = 0.529177210903
     EV_PER_HA = 27.211386245988
-    # gradient[Ha/Bohr] = gradient_eV_Ang × BOHR_TO_ANG / EV_PER_HA
+    BOHR_TO_ANG = GaussianExternalInput.BOHR_TO_ANG
     GRAD_CONV = BOHR_TO_ANG / EV_PER_HA
-
-
-    def _read_input(filename):
-        """
-        Parse a Gaussian External input file.
-
-        Returns
-        -------
-        tuple
-            (natoms, deriv_order, charge, spin, atomic_numbers, positions_ang)
-            where positions_ang is in Angstrom.
-        """
-        with open(filename) as fh:
-            lines = fh.readlines()
-        header = lines[0].split()
-        natoms = int(header[0])
-        deriv_order = int(header[1])
-        charge = int(header[2])
-        spin = int(header[3])
-        atomic_numbers = []
-        positions_ang = []
-        for line in lines[1 : natoms + 1]:
-            parts = line.split()
-            atomic_numbers.append(int(float(parts[0])))
-            positions_ang.append(
-                [
-                    float(parts[1]) * BOHR_TO_ANG,
-                    float(parts[2]) * BOHR_TO_ANG,
-                    float(parts[3]) * BOHR_TO_ANG,
-                ]
-            )
-        return natoms, deriv_order, charge, spin, atomic_numbers, positions_ang
 
 
     def _write_output(filename, energy_ha, gradient_ha_bohr=None):
@@ -126,7 +146,6 @@ _SCRIPT_TEMPLATE = textwrap.dedent(
             Note: gradient = −force.  Pass None for energy-only jobs.
         """
         with open(filename, "w") as fh:
-            # Energy and dipole (dipole set to zero — not provided).
             fh.write(
                 f"{{energy_ha:20.12E}}{{0.0:20.12E}}{{0.0:20.12E}}{{0.0:20.12E}}\\n"
             )
@@ -136,7 +155,6 @@ _SCRIPT_TEMPLATE = textwrap.dedent(
 
 
     def main():
-        # The six standard Gaussian External parameters are always last.
         if len(sys.argv) < 7:
             sys.stderr.write(
                 f"Usage: {{sys.argv[0]}} [extra_args] "
@@ -148,32 +166,19 @@ _SCRIPT_TEMPLATE = textwrap.dedent(
         input_file = sys.argv[-5]
         output_file = sys.argv[-4]
         msg_file = sys.argv[-3]
-        # fchk_file and matel_file are not used for ASE-based calculations.
 
         try:
-            (
-                natoms,
-                deriv_order,
-                charge,
-                spin,
-                atomic_numbers,
-                positions_ang,
-            ) = _read_input(input_file)
+            inp = GaussianExternalInput(input_file)
+            atoms = Atoms(numbers=inp.atomic_numbers, positions=inp.positions_ang)
 
-            atoms = Atoms(numbers=atomic_numbers, positions=positions_ang)
-
-            # ── Instantiate the calculator ─────────────────────────────────
             {calc_init}
             atoms.calc = calc
 
-            # ── Compute energy ─────────────────────────────────────────────
             energy_ev = atoms.get_potential_energy()
             energy_ha = energy_ev / EV_PER_HA
 
-            # ── Compute gradient (if requested) ────────────────────────────
             gradient_ha_bohr = None
-            if deriv_order >= 1:
-                # ASE forces = −gradient; gradient = −forces.
+            if inp.deriv_order >= 1:
                 forces_ev_ang = atoms.get_forces()
                 gradient_ha_bohr = -forces_ev_ang * GRAD_CONV
 
@@ -201,7 +206,6 @@ _SCRIPT_TEMPLATE = textwrap.dedent(
     '''
 )
 
-# ── Pickle-based variant (fallback) ───────────────────────────────────────
 _PICKLE_TEMPLATE = textwrap.dedent(
     '''\
     #!/usr/bin/env python
@@ -215,35 +219,13 @@ _PICKLE_TEMPLATE = textwrap.dedent(
 
     import numpy as np
     from ase import Atoms
+    from chemsmart.io.gaussian.external_script import GaussianExternalInput
 
-    BOHR_TO_ANG = 0.529177210903
     EV_PER_HA = 27.211386245988
+    BOHR_TO_ANG = GaussianExternalInput.BOHR_TO_ANG
     GRAD_CONV = BOHR_TO_ANG / EV_PER_HA
 
     _PICKLE_FILE = os.path.join(os.path.dirname(__file__), "{pickle_name}")
-
-
-    def _read_input(filename):
-        with open(filename) as fh:
-            lines = fh.readlines()
-        header = lines[0].split()
-        natoms = int(header[0])
-        deriv_order = int(header[1])
-        charge = int(header[2])
-        spin = int(header[3])
-        atomic_numbers = []
-        positions_ang = []
-        for line in lines[1 : natoms + 1]:
-            parts = line.split()
-            atomic_numbers.append(int(float(parts[0])))
-            positions_ang.append(
-                [
-                    float(parts[1]) * BOHR_TO_ANG,
-                    float(parts[2]) * BOHR_TO_ANG,
-                    float(parts[3]) * BOHR_TO_ANG,
-                ]
-            )
-        return natoms, deriv_order, charge, spin, atomic_numbers, positions_ang
 
 
     def _write_output(filename, energy_ha, gradient_ha_bohr=None):
@@ -270,16 +252,8 @@ _PICKLE_TEMPLATE = textwrap.dedent(
         msg_file = sys.argv[-3]
 
         try:
-            (
-                natoms,
-                deriv_order,
-                charge,
-                spin,
-                atomic_numbers,
-                positions_ang,
-            ) = _read_input(input_file)
-
-            atoms = Atoms(numbers=atomic_numbers, positions=positions_ang)
+            inp = GaussianExternalInput(input_file)
+            atoms = Atoms(numbers=inp.atomic_numbers, positions=inp.positions_ang)
 
             with open(_PICKLE_FILE, "rb") as fh:
                 calc = pickle.load(fh)
@@ -289,7 +263,7 @@ _PICKLE_TEMPLATE = textwrap.dedent(
             energy_ha = energy_ev / EV_PER_HA
 
             gradient_ha_bohr = None
-            if deriv_order >= 1:
+            if inp.deriv_order >= 1:
                 forces_ev_ang = atoms.get_forces()
                 gradient_ha_bohr = -forces_ev_ang * GRAD_CONV
 
@@ -317,106 +291,128 @@ _PICKLE_TEMPLATE = textwrap.dedent(
 
 class ASEExternalCalculatorScript:
     """
-    Generates a Gaussian External script that wraps an arbitrary ASE calculator.
+    Generates a Gaussian External script from an ASE calculator *class*.
 
     The generated script is a self-contained Python file that Gaussian calls
-    during energy/force evaluations.  It reads Gaussian's External input
-    file, runs the specified ASE calculator, and writes the result in
-    Gaussian's External output format (energy in Hartree, gradient in
-    Hartree/Bohr).
-
-    Two code-generation strategies are supported:
-
-    **Code generation** (preferred, transparent):
-        Pass a calculator *class* together with ``calc_kwargs``, or pass a
-        calculator *instance* together with ``calc_kwargs``.  The script
-        will contain a plain import and instantiation statement that can be
-        read and edited.
-
-    **Pickle fallback** (arbitrary instances):
-        Pass a calculator *instance* without ``calc_kwargs``.  If the
-        calculator does not implement ``todict()``, the instance is
-        serialised with :mod:`pickle` and the script loads it at runtime.
-        An additional ``<script_name>.pkl`` file is written alongside the
-        script.
+    during energy/force evaluations.  It imports and instantiates the
+    calculator class by name, making the output human-readable and editable.
 
     Parameters
     ----------
-    calculator : type or ASE Calculator instance
-        The ASE calculator class **or** an instantiated calculator.
-    calc_kwargs : dict, optional
+    calculator_class : type
+        An ASE calculator class (not an instance).
+    calc_kwargs : dict
         Keyword arguments passed to the calculator constructor in the
-        generated script.  Required when *calculator* is a class.
-        When *calculator* is an instance and *calc_kwargs* is omitted,
-        the class tries ``calculator.todict()`` and falls back to pickle.
-    script_name : str
-        Base name for the generated script (without ``.py`` extension).
+        generated script.
 
     Examples
     --------
-    Code-generation path (recommended)::
+    ::
 
         from mace.calculators import MACECalculator
         script = ASEExternalCalculatorScript(
             MACECalculator,
             calc_kwargs={"model_paths": ["model.model"], "device": "cpu"},
-            script_name="run_mace",
         )
-        script.write("/path/to/job/dir")
-
-    Pickle path (arbitrary instance)::
-
-        calc = SomeExoticCalculator(param=42)
-        script = ASEExternalCalculatorScript(calc, script_name="run_exotic")
-        script.write("/path/to/job/dir")
+        script.write("/path/to/job/dir", "run_mace.py")
     """
 
-    def __init__(self, calculator, calc_kwargs=None, script_name="ase_calculator"):
-        self.script_name = script_name
-        self._use_pickle = False
-        self._pickle_bytes = None
+    def __init__(self, calculator_class, calc_kwargs):
+        if not inspect.isclass(calculator_class):
+            raise TypeError(
+                "calculator_class must be a class. "
+                "To use a calculator instance, use ASEPickleExternalScript."
+            )
+        if calc_kwargs is None:
+            raise ValueError(
+                "calc_kwargs is required when passing a calculator class. "
+                "Provide the constructor arguments as a dict."
+            )
+        self._calc_module = calculator_class.__module__
+        self._calc_class_name = calculator_class.__name__
+        self.calc_kwargs = calc_kwargs
 
-        if inspect.isclass(calculator):
-            if calc_kwargs is None:
-                raise ValueError(
-                    "calc_kwargs is required when passing a calculator class. "
-                    "Provide the constructor arguments as a dict."
-                )
-            self._calc_module = calculator.__module__
-            self._calc_class_name = calculator.__name__
-            self.calc_kwargs = calc_kwargs
-        else:
-            # Instance provided
-            self._calc_module = type(calculator).__module__
-            self._calc_class_name = type(calculator).__name__
-            if calc_kwargs is not None:
-                self.calc_kwargs = calc_kwargs
-            elif hasattr(calculator, "todict"):
-                logger.debug(
-                    f"Extracting calculator parameters via "
-                    f"{self._calc_class_name}.todict()."
-                )
-                self.calc_kwargs = calculator.todict()
-            else:
-                logger.debug(
-                    f"No calc_kwargs provided and {self._calc_class_name} "
-                    "does not implement todict(); falling back to pickle."
-                )
-                import pickle
-
-                self._pickle_bytes = pickle.dumps(calculator)
-                self._use_pickle = True
-                self.calc_kwargs = None
-
-    @property
-    def script_filename(self):
-        """Filename of the generated script (with .py extension)."""
-        name = self.script_name
-        return name if name.endswith(".py") else name + ".py"
-
-    def write(self, directory="."):
+    def write(self, directory, filename):
         """
-        Write the external calculator script (and optional pickle file).
+        Write the external calculator script.
+
+        The script is made executable (``chmod +x``).
+
+        Parameters
+        ----------
+        directory : str
+            Directory in which to write the file.
+        filename : str
+            Name of the script file (e.g. ``"run_mace.py"``).
+
+        Returns
+        -------
+        str
+            Absolute path to the written script.
+        """
+        os.makedirs(directory, exist_ok=True)
+        script_path = os.path.join(directory, filename)
+        content = self._generate_script(filename)
+        with open(script_path, "w") as fh:
+            fh.write(content)
+        current = os.stat(script_path).st_mode
+        os.chmod(script_path, current | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        logger.info(f"Wrote Gaussian External script: {script_path}")
+        return os.path.abspath(script_path)
+
+    def _generate_script(self, filename):
+        """Return the complete script content as a string."""
+        calc_import = (
+            f"from {self._calc_module} import {self._calc_class_name}"
+        )
+        calc_init = f"calc = {self._calc_class_name}(**{self.calc_kwargs!r})"
+        return _SCRIPT_TEMPLATE.format(
+            script_name=filename,
+            calc_import=calc_import,
+            calc_init=calc_init,
+            calc_class_name=self._calc_class_name,
+        )
+
+
+class ASEPickleExternalScript:
+    """
+    Generates a Gaussian External script from an ASE calculator *instance*
+    via pickle serialisation.
+
+    Use this class when the calculator cannot be reconstructed from a
+    plain import + constructor call (e.g. it holds trained model weights
+    in memory and does not implement ``todict()``).
+
+    An additional ``<base>.pkl`` file is written alongside the script and
+    loaded at runtime by the generated script.
+
+    Parameters
+    ----------
+    calculator : ASE Calculator instance
+        An instantiated calculator to serialise.
+
+    Examples
+    --------
+    ::
+
+        calc = SomeExoticCalculator(param=42)
+        script = ASEPickleExternalScript(calc)
+        script.write("/path/to/job/dir", "run_exotic.py")
+    """
+
+    def __init__(self, calculator):
+        if inspect.isclass(calculator):
+            raise TypeError(
+                "calculator must be an instance, not a class. "
+                "To use a calculator class, use ASEExternalCalculatorScript."
+            )
+        import pickle
+
+        self._pickle_bytes = pickle.dumps(calculator)
+
+    def write(self, directory, filename):
+        """
+        Write the pickle-based external calculator script and ``.pkl`` file.
 
         The script is made executable (``chmod +x``).
 
@@ -424,53 +420,28 @@ class ASEExternalCalculatorScript:
         ----------
         directory : str
             Directory in which to write the files.
+        filename : str
+            Name of the script file (e.g. ``"run_exotic.py"``).
 
         Returns
         -------
         str
-            Absolute path to the written ``.py`` script.
+            Absolute path to the written script.
         """
         os.makedirs(directory, exist_ok=True)
-        script_path = os.path.join(directory, self.script_filename)
-        content = self._generate_script(directory)
+        script_path = os.path.join(directory, filename)
+        base = os.path.splitext(filename)[0]
+        pickle_name = base + ".pkl"
+        content = _PICKLE_TEMPLATE.format(pickle_name=pickle_name)
         with open(script_path, "w") as fh:
             fh.write(content)
-        # Make the script executable
         current = os.stat(script_path).st_mode
         os.chmod(script_path, current | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-        logger.info(f"Wrote Gaussian External script: {script_path}")
+        logger.info(f"Wrote Gaussian External pickle script: {script_path}")
 
-        if self._use_pickle:
-            pickle_name = self.script_name + ".pkl"
-            pickle_path = os.path.join(directory, pickle_name)
-            with open(pickle_path, "wb") as fh:
-                fh.write(self._pickle_bytes)
-            logger.info(f"Wrote calculator pickle: {pickle_path}")
+        pickle_path = os.path.join(directory, pickle_name)
+        with open(pickle_path, "wb") as fh:
+            fh.write(self._pickle_bytes)
+        logger.info(f"Wrote calculator pickle: {pickle_path}")
 
         return os.path.abspath(script_path)
-
-    # ── Private helpers ───────────────────────────────────────────────────
-
-    def _generate_script(self, directory):
-        """Return the complete script content as a string."""
-        if self._use_pickle:
-            return self._generate_pickle_script()
-        return self._generate_code_script()
-
-    def _generate_code_script(self):
-        """Generate the code-based script (import + instantiation)."""
-        calc_import = (
-            f"from {self._calc_module} import {self._calc_class_name}"
-        )
-        calc_init = f"calc = {self._calc_class_name}(**{self.calc_kwargs!r})"
-        return _SCRIPT_TEMPLATE.format(
-            script_name=self.script_filename,
-            calc_import=calc_import,
-            calc_init=calc_init,
-            calc_class_name=self._calc_class_name,
-        )
-
-    def _generate_pickle_script(self):
-        """Generate the pickle-based fallback script."""
-        pickle_name = self.script_name + ".pkl"
-        return _PICKLE_TEMPLATE.format(pickle_name=pickle_name)
